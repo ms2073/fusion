@@ -6,9 +6,31 @@ A model router for [opencode](https://opencode.ai) and
 model is actually good at that kind of work, and rotates two API keys so you stop
 collecting 429s.
 
-Inspired by [Sakana's Fugu](https://sakana.ai/fugu/) — the same idea of a coordinator
-assigning specialist roles behind one OpenAI-compatible endpoint, with hand-written rules
-in place of Fugu's evolved coordinator.
+## Where the idea came from
+
+[Sakana AI's Fugu](https://sakana.ai/fugu/) makes an argument worth taking seriously: that
+picking one frontier model for a whole task is the wrong unit of choice. Fugu instead puts a
+**coordinator** in front of a pool of models and assigns specialist roles per task —
+**Thinker** for analysis and planning, **Worker** to execute, **Verifier** to validate —
+and exposes the lot through a single API, so the caller never manages endpoints. The
+research behind it, TRINITY (ICLR 2026), uses a *lightweight evolved coordinator* to
+delegate across coding, maths, reasoning and knowledge tasks. It scores 59.0 on SWE-Bench
+Pro (73.7 for Fugu Ultra) and 92.9 on LiveCodeBench.
+
+Fusion borrows the shape and diverges on two points, both deliberate.
+
+**The coordinator is hand-written, not evolved.** Fugu's is trained; this one is ordered
+rules you can read in `coordinator.py` and change in a text editor. That is a real
+capability gap — a learned router will find delegations these rules never will — bought in
+exchange for being able to explain, in one line, why any given request went where it did.
+Every decision and the signals behind it land in `/stats`.
+
+**Fugu does not have to survive a free tier.** It runs on infrastructure it controls. Fusion
+runs on a pool where four frontier models can be simultaneously queued, where a `200` means
+"accepted, now wait", and where availability flips within seconds. So most of what is here —
+hedged racing, the governor, escalating backoff, a tail model in every role — exists for a
+problem Fugu never had. The role assignment is Fugu's idea. Everything that keeps it
+answering is not.
 
 ```
 opencode     ──► /v1/chat/completions ──┐
@@ -91,9 +113,17 @@ path itself.
 ```bash
 ANTHROPIC_BASE_URL=http://localhost:8787 \
 ANTHROPIC_AUTH_TOKEN=fusion-local \
-ANTHROPIC_MODEL=fusion/auto \
+ANTHROPIC_MODEL='fusion/think[1m]' \
 claude
 ```
+
+Verified end to end: Claude Code answers through the router, and `/stats` shows
+`lane=think role=thinker served_by=nvidia/nemotron-3-ultra-550b-a55b`.
+
+The `[1m]` suffix matters. Claude Code does not recognise `fusion/*` as a model,
+so it assumes a 200k context window and starts auto-compacting the conversation
+long before it needs to — every model behind these lanes holds 1M. The suffix
+tells it the real window. `CLAUDE_CODE_MAX_CONTEXT_TOKENS` does the same job.
 
 Or make it permanent in `~/.claude/settings.json`:
 
