@@ -391,6 +391,50 @@ Measured effect of the last two, same request: **4:00 and incomplete → 1:08 an
 
 Re-run `make probe` when things feel slow; it recommends which model to promote.
 
+## Measuring it
+
+The numbers above are reproducible, not remembered:
+
+```bash
+python scripts/loadtest.py            # 14 requests, all at once
+python scripts/loadtest.py -n 30 -c 10
+```
+
+A real run against three keys:
+
+```
+  14 requests, 14 in flight, model fusion/auto
+  14/14 succeeded in 12.1s wall
+
+  time to first token   p50   0.68s   p95   4.30s   p99   4.32s
+  total duration        p50   2.25s   p95   6.19s   p99  12.05s
+
+  429s absorbed by the governor : 0
+  429s that reached the client  : 0
+  dispatches per request        : 1.29 (1.0 = no hedging cost)
+
+  dispatched → answered, by model:
+    nvidia/nemotron-3-ultra-550b-a55b           15 → 14
+    deepseek-ai/deepseek-v4-pro                  3 → 0
+
+  spread across keys: key0 6, key1 6, key2 6
+```
+
+Two of those lines matter more than the percentiles.
+
+**Dispatches per request** is the cost of hedging. At 1.29 the pool is healthy
+and most requests are answered by the first model tried. If it climbs toward
+`hedge.max_parallel`, the hedge delay has fallen below the pool's real
+time-to-first-token and every request is paying for racers it does not need.
+
+**429s absorbed versus surfaced** is the governor's whole job, and it is only
+visible by diffing `/stats` either side of the run — the client sees success
+either way, which is the point.
+
+Attribution comes from `/stats`, not from the stream: the router rewrites the
+`model` field to the lane's identity so callers see one stable name, which means
+the stream cannot tell you which upstream actually answered.
+
 ## Limitations
 
 - **The coordinator is hand-written**, not learned. Fugu's is evolved/RL-trained; this one
