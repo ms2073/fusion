@@ -1,0 +1,13 @@
+services:
+  fusion:
+    build: .
+    container_name: fusion
+    env_file: .env
+    ports:
+      # Bound to loopback: the proxy holds your NIM keys and has no auth of its
+      # own, so nothing off this machine should be able to reach it.
+      - "127.0.0.1:8787:8787"
+    volumes:
+      # Live-editable so you can tune routing without rebuilding the image.
+      - ./config.yaml:/app/config.yaml:ro
+    restart: unless-stopped

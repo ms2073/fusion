@@ -1,0 +1,253 @@
+# Fusion router configuration.
+#
+# Model IDs are validated against NIM's live catalog at startup. If any ID here
+# does not exist upstream, the app logs a loud warning and (when a close match
+# exists) tells you what to change it to. Run `python -m fusion.catalog` to dump
+# the live catalog.
+
+upstream:
+  base_url: https://integrate.api.nvidia.com/v1
+  # Agentic coding turns can be slow; DeepSeek in particular.
+  timeout_seconds: 600
+  connect_timeout_seconds: 15
+  # Max silence between bytes, NOT total duration. On the free tier the big
+  # models are frequently queued behind other users and will accept a request
+  # then sit there - this is what turns a 10-minute hang into a fast failover
+  # to the next model. 30s because a queued model rarely recovers quickly -
+  # raise it if you see healthy models being abandoned mid-answer.
+  #
+  # This is the budget for a *short* prompt. Time-to-first-token grows with the
+  # payload, since the model reads all of it before saying anything, so the
+  # allowance below is added per 100k tokens. Without it a long agentic session
+  # dies the moment its context outgrows what 30s can prefill: every racer
+  # times out and the request fails outright instead of merely slowly.
+  stall_timeout_seconds: 30
+  stall_timeout_per_100k_tokens: 45
+  # Silence allowed *after* the model has started answering, enforced instead of
+  # the stall budget from the first token onward. The two deadlines are not the
+  # same job and must not share a number: before the first token, dropping a
+  # model is free because another is already racing it; after, the client holds
+  # bytes and there is no failover left. Reusing the 30s race deadline for both
+  # is how nemotron-3-ultra - a model that was answering perfectly well - got
+  # cut off mid-sentence for pausing to think, and reported as a ReadTimeout.
+  #
+  # Generous on purpose. Mid-answer silence is normal here, not a crash: an
+  # opencode-shaped request measured an 18.2s gap and then finished cleanly, so
+  # NIM evidently parks a stream mid-generation when the tier is busy and picks
+  # it up again later. timeout_seconds above is the real backstop, and killing a
+  # stream early only converts a slow answer into a truncated one.
+  idle_timeout_seconds: 300
+
+rate_limit:
+  # NIM documents ~40 RPM per model as a best-effort ceiling. We pace slightly
+  # under it so we bounce off our own limiter rather than collecting 429s.
+  default_rpm: 36
+  # A (key, model) pair that 429s enters cooldown for this long, doubling on
+  # repeats up to the max. A Retry-After header always wins over these.
+  cooldown_base_seconds: 5
+  cooldown_max_seconds: 120
+  # Where the backoff *starts* for a model that went quiet - either stalling
+  # outright, or losing a race it had more time to win. It doubles from here up
+  # to cooldown_max_seconds, so one bad sample costs little (measured
+  # availability flips within ~15s) while a model that is quiet every single
+  # time is progressively left alone, and returns the moment it answers again.
+  #
+  # Getting that escalation wrong is expensive. While a stall was being
+  # reported as an authoritative Retry-After, glm-5.2 drew this same flat 20s
+  # after each of 131 consecutive failures and led the list into every request.
+  stall_cooldown_seconds: 20
+  # How long a model that answered 404 is dropped for. NIM returns 404 both
+  # for models your account cannot call at all and, occasionally, for one
+  # whose backend is briefly unrouteable - so this expires rather than being
+  # permanent. `make probe` tells you which kind you have.
+  unavailable_seconds: 900
+  # Consecutive non-429 failures before a model is cut out entirely.
+  breaker_failure_threshold: 5
+  breaker_reset_seconds: 60
+
+# Racing beats waiting on this API. Measured against the free tier: sequential
+# failover took 68s because each queued model burned its stall timeout before
+# the next was tried; hedging answered the same pool in 0.35s. Models flip
+# between fast and queued within ~15s, so which one is "best" cannot be known
+# in advance - only discovered by asking several at once.
+hedge:
+  enabled: true
+  # The leader gets this long alone. A healthy primary answers well inside it,
+  # so the common case still costs exactly one upstream request.
+  delay_seconds: 2.5
+  max_parallel: 3
+
+routing:
+  # Role used when nothing else matches.
+  default_role: thinker
+  # Payloads estimated above this many tokens go to the Librarian regardless of
+  # what else the request looks like. Sits just under Kimi's 262k window, so the
+  # Librarian gets the band it is best at and anything bigger falls through the
+  # feasibility check to a 1M model.
+  long_context_tokens: 250000
+  # Thinker -> Worker plan-then-code chain on fresh coding tasks.
+  chain_enabled: true
+  # Max tokens the Thinker may spend on the plan before the Worker takes over.
+  chain_plan_max_tokens: 900
+  # Static review pass after the Worker. Off: it cannot run tests or read files
+  # (only opencode can), so it buys little and costs 2-3x the rate-limit budget.
+  verifier_enabled: false
+  # Ask a small model to classify genuinely ambiguous first turns.
+  ambiguous_escalation: true
+
+classifier:
+  # Small, because this call only ever emits one word and must not eat budget
+  # from the models doing real work - but it must also be a *plain instruct*
+  # model, which is the part that is easy to get wrong.
+  #
+  # This was nvidia-nemotron-nano-9b-v2, a reasoning model: its `content` is
+  # always null and the answer lives in `reasoning_content`, so a 4-token
+  # budget bought four tokens of "Okay, let's see..." and never a verdict.
+  # Every ambiguous request paid for a call that returned classifier:empty_reply
+  # and then fell back to the default role anyway. gpt-oss-20b fails the same
+  # way. llama-3.1-8b-instruct answers "code" in 0.35s, in plain content.
+  model: meta/llama-3.1-8b-instruct
+  max_tokens: 8
+  timeout_seconds: 8
+
+session:
+  # Sticky routing so a conversation does not flip-flop between models mid-task.
+  ttl_seconds: 3600
+  max_entries: 512
+
+# Ordered preference lists. Position 0 is the primary; the rest are failover
+# targets used when every API key for the models above them is cooling down.
+# The frontier models lead every list because they are the right tool when
+# available. But on the free tier they are heavily contended - `make probe` has
+# seen all four simultaneously QUEUED or 529 - so every role ends in a model
+# that reliably answers in under a second. Without that tail, a busy hour means
+# opencode gets an error instead of a slightly weaker answer.
+#
+# moonshotai/kimi-k2.6 is deliberately absent: it appears in /v1/models but
+# returns 404 "Not found for account" on inference. Re-add it if your account
+# gains access - `make probe` will tell you.
+roles:
+  thinker:
+    # Ordered by what each model is *best* at, not by who is fast today -
+    # availability flips within seconds and the governor already routes around
+    # it, so encoding a snapshot of it here would just be wrong by tomorrow.
+    #
+    # glm-5.2 leads on the published split: it is the stronger model for
+    # planning and one-shot generation specifically, tops open weights on
+    # SWE-bench Pro (62.1%) and Terminal-Bench 2.1 (81.0%).
+    # nemotron-3-ultra follows as the frontier reasoner - IOI 2025 score of 570
+    # is top-3-human competitive programming, and it is built as an
+    # orchestration model, which is exactly this role.
+    models:
+      - z-ai/glm-5.2
+      - nvidia/nemotron-3-ultra-550b-a55b
+      - deepseek-ai/deepseek-v4-pro
+      - nvidia/nemotron-3-super-120b-a12b
+  worker:
+    # v4-pro holds the top SWE-bench Verified score in this pool (80.6%), and
+    # the gap to v4-flash is only 1.6 points on raw code - but 8-10 points on
+    # *agentic* evals, which is what opencode actually runs. So flash drops
+    # below the agentic specialists rather than sitting directly behind pro.
+    #
+    # step-3.7-flash is here for one specific reason: >98% on tau^2-bench
+    # across all difficulty levels, the best tool-calling accuracy measured in
+    # this pool, and a wrong tool call is the expensive failure in a loop.
+    models:
+      - deepseek-ai/deepseek-v4-pro
+      - nvidia/nemotron-3-ultra-550b-a55b
+      - z-ai/glm-5.2
+      - stepfun-ai/step-3.7-flash
+      - deepseek-ai/deepseek-v4-flash
+      - nvidia/nemotron-3-super-120b-a12b
+  librarian:
+    # Needs genuine million-token windows, so the fast-but-smaller Nemotrons
+    # only qualify once the coordinator confirms the payload actually fits.
+    # Every entry holds a million tokens, so nothing drops out of this role as
+    # the payload grows - the one thing the Librarian must never do.
+    #
+    # glm-5.2 leads here rather than in Worker: the reviews converge on it as
+    # the pick once a codebase passes ~200k tokens, for repo-scale refactoring
+    # and long-horizon engineering. nemotron-3-super ends the list rather than
+    # nemotron-3-nano - nano is faster (0.32s vs 0.39s, a difference nobody
+    # notices) but scores 14 on the Artificial Analysis index against super's
+    # 25, and 15.8 on coding against 31.2. Cross-referencing a repo is the
+    # wrong place to trade that much comprehension for 70ms.
+    models:
+      - z-ai/glm-5.2
+      - deepseek-ai/deepseek-v4-pro
+      - nvidia/nemotron-3-ultra-550b-a55b
+      - minimaxai/minimax-m3
+      - nvidia/nemotron-3-super-120b-a12b
+  eyes:
+    # Every model here was verified to actually see, by sending a solid-colour
+    # PNG and checking it came back with the right colour. Claiming vision from
+    # a spec sheet is how an image request ends up at a model that answers
+    # "multimodal processing is not enabled" - which is exactly what
+    # nemotron-3-ultra does, despite being the strongest model in the pool.
+    #
+    # minimax-m3 leads on capability: trained on mixed text/image/video from
+    # step 0, alone in open weights for UI automation and screenshot-to-code,
+    # and able to drive a desktop from screenshots. nano-omni is the fast
+    # fallback - omni-modal, answered 3/3 at 0.30s, and took a 202k payload.
+    models:
+      - minimaxai/minimax-m3
+      - nvidia/nemotron-3-nano-omni-30b-a3b-reasoning
+      - meta/llama-3.2-90b-vision-instruct
+      - nvidia/nemotron-nano-12b-v2-vl
+  verifier:
+    models: [z-ai/glm-5.2, nvidia/nemotron-3-super-120b-a12b]
+
+# Per-model overrides. `vision: true` marks a model as able to accept image
+# parts - the coordinator will never route an image request to one without it.
+# Context values are the vendors' published figures. NIM may serve less than a
+# model's native maximum, and its API does not report per-model limits - so if
+# you see upstream context errors, lower the offending number here.
+models:
+  z-ai/glm-5.2:
+    context: 1000000        # 1M via IndexShare sparse attention; 131k max output
+  deepseek-ai/deepseek-v4-pro:
+    context: 1000000        # text-only
+  deepseek-ai/deepseek-v4-flash:
+    context: 1000000        # text-only
+  minimaxai/minimax-m3:
+    context: 512000         # 1M headline, 512k *guaranteed* by the vendor. The
+                            # floor is right here only because it is a published
+                            # guarantee, not a hedge - and 512k still clears
+                            # long_context_tokens, so it never drops out early.
+                            # 202k verified directly (42s - slow but it lands).
+    vision: true            # native text + image + video from step 0; verified
+  stepfun-ai/step-3.7-flash:
+    context: 256000         # 196B language backbone + 1.8B ViT; 202k verified
+  nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:
+    context: 1000000        # 202k verified
+    vision: true            # omni-modal: image, video, speech; verified
+
+  # Reliability tail. "Deliberately conservative" was the wrong instinct here:
+  # understating a context does not route away from a model politely, it
+  # *deletes* it from exactly the requests that need a fallback most. This
+  # entry said 131072 - an 8x understatement - so every request past 131k lost
+  # the only model in the pool that was answering, and a long session stopped
+  # working rather than slowing down. Verify these; do not hedge them.
+  nvidia/nemotron-3-super-120b-a12b:
+    context: 1000000        # vendor figure; 202k verified directly
+  nvidia/nemotron-3-ultra-550b-a55b:
+    context: 1000000        # 202k verified; 0.47s small, 7.5s at 202k.
+                            # Text-only: it rejects image parts outright.
+  meta/llama-3.1-8b-instruct:
+    context: 131072         # the classifier; never routed to, but listed so the
+                            # startup catalog check covers it too
+  meta/llama-3.2-90b-vision-instruct:
+    context: 131072
+    vision: true
+  nvidia/nemotron-nano-12b-v2-vl:
+    context: 32768
+    vision: true
+
+# Virtual model names exposed to opencode. `auto` runs the full coordinator;
+# the rest pin a role and skip classification.
+lanes:
+  auto: null
+  think: thinker
+  code: worker
+  context: librarian
+  vision: eyes

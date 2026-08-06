@@ -1,0 +1,44 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "provider": {
+    "fusion": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Fusion (NVIDIA NIM router)",
+      "options": {
+        "baseURL": "http://localhost:8787/v1",
+        "apiKey": "fusion-local"
+      },
+      "models": {
+        "auto": {
+          "name": "Fusion Auto - detects intent, plans before coding",
+          "limit": { "context": 1000000, "output": 65536 }
+        },
+        "think": {
+          "name": "Fusion Think - Thinker (GLM 5.2 / Nemotron 3 Ultra)",
+          "limit": { "context": 1000000, "output": 65536 }
+        },
+        "code": {
+          "name": "Fusion Code - Worker (DeepSeek V4 Pro / Nemotron 3 Ultra)",
+          "limit": { "context": 1000000, "output": 65536 }
+        },
+        "context": {
+          "name": "Fusion Context - Librarian (GLM 5.2, repo-scale)",
+          "limit": { "context": 1000000, "output": 65536 }
+        },
+        "vision": {
+          "name": "Fusion Vision - Eyes (MiniMax M3)",
+          "limit": { "context": 512000, "output": 65536 }
+        }
+      }
+    }
+  },
+
+  "model": "fusion/auto",
+  "small_model": "fusion/auto",
+
+  "agent": {
+    "build": { "model": "fusion/auto" },
+    "plan": { "model": "fusion/think" }
+  }
+}
