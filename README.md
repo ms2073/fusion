@@ -1,5 +1,10 @@
 # Fusion
 
+[![test](https://github.com/ms2073/fusion/actions/workflows/test.yml/badge.svg)](https://github.com/ms2073/fusion/actions/workflows/test.yml)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Tests: 201](https://img.shields.io/badge/tests-201%20passing-brightgreen)](tests/)
+
 A model router for [opencode](https://opencode.ai) and
 [Claude Code](https://claude.com/claude-code) that sits in front of the free
 [NVIDIA NIM](https://build.nvidia.com) API. It reads each request, sends it to whichever

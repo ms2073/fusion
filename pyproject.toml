@@ -1,5 +1,5 @@
 [project]
-name = "fusion"
+name = "fusion-llm-router"
 version = "0.1.0"
 description = "Fugu-style model router for opencode over NVIDIA NIM"
 requires-python = ">=3.12"
